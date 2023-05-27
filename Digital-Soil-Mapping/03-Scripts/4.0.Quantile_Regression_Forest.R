@@ -26,7 +26,7 @@ gc()
 # 0 - Set working directory, soil attribute, and packages ======================
 
 # Working directory
-#wd <- 'C:/Users/luottoi/Documents/GitHub/GSNmap-TM/Digital-Soil-Mapping'
+# wd <- 'C:/workspace2/github/smroecker/GSNmap-TM/Digital-Soil-Mapping'
 wd <- 'C:/Users/hp/Documents/GitHub/GSNmap-TM/Digital-Soil-Mapping'
 
 setwd(wd)
@@ -44,9 +44,12 @@ soilatt<- "soc_0_30"
 load(file = "03-Scripts/eval.RData")
 
 #load packages
-library(tidyverse)
+# library(tidyverse)
+library(dplyr)
+library(ggplot2)
 library(data.table)
 library(caret)
+library(ranger)
 library(quantregForest)
 library(terra)
 library(sf)
@@ -56,34 +59,55 @@ library(doParallel)
 # 1 - Merge soil data with environmental covariates ============================
 
 ## 1.1 - Load covariates -------------------------------------------------------
-covs <- rast("01-Data/covs/Covariates.tif") # match case of the file name
-ncovs <- names(covs)
+files <- list.files(path= '01-Data/covs/', pattern = '.tif$', full.names = T)
+ncovs <- list.files(path= '01-Data/covs/', pattern = '.tif$', full.names = F)
+#In case of extent error, or if covariates other than the default ones are added
+# ref <- rast(files[1])
+# covs <- list()
+# for (i in seq_along(files)) {
+#   r <- rast(files[i])
+#   r <- project(r, ref)
+#   covs[[i]] <- r
+# }
+# covs <- rast(covs)
+
+covs  <- rast(files)
+ncovs <- filename <- names(covs)
+
+new_nm  <- c("dtm_neg", "dtm_pos")
+var <- c("dtm_neg_openness_250m", "dtm_pos_openness_250m")
+idx <- sapply(var, function(x) grep(x, names(covs)))
+names(covs)[idx] <- new_nm
+
 
 ## 1.2 - Load the soil data (Script 2) -----------------------------------------
-dat <- read_csv("02-Outputs/harmonized_soil_data.csv")
+dat <- read.csv("02-Outputs/harmonized_soil_data.csv")
+
 
 # Convert soil data into a spatial object (check https://epsg.io/6204)
 dat <- vect(dat, geom=c("x", "y"), crs = crs(covs))
+
 
 # Reproject point coordinates to match coordinate system of covariates
 dat <- terra::project(dat, covs)
 names(dat)
 
-## 1.3 - Extract values from covariates to the soil points ---------------------
-pv <- terra::extract(x = covs, y = dat, xy=F)
-dat <- cbind(dat,pv)
-dat <- as.data.frame(dat)
 
+## 1.3 - Extract values from covariates to the soil points ---------------------
+pv <- terra::extract(x = covs, y = dat, xy = F, )
+dat <- as.data.frame(dat) |> cbind(pv)
 summary(dat)
 
 
 
 ## 1.4 - Target soil attribute + covariates ------------------------------------
-d <- dplyr::select(dat, soilatt, names(covs))
+d <- dat |> 
+  dplyr::select(soc_0_30, names(covs))
 d <- na.omit(d)
 
-# 2 - Covariate selection with RFE =============================================
-## 2.1 - Setting parameters ----------------------------------------------------
+# 2 - Covariate selection =============================================
+## 2.1 with RFE
+## 2.1.1 - Setting parameters ----------------------------------------------------
 # Repeatedcv = 3-times repeated 10-fold cross-validation
 fitControl <- rfeControl(functions = rfFuncs,
                          method = "repeatedcv",
@@ -102,7 +126,7 @@ cl <- makeCluster(detectCores()-1)
 registerDoParallel(cl)
 
 
-## 2.2 - Calibrate a RFE model to select covariates ----------------------------
+### 2.1.2 - Calibrate a RFE model to select covariates ----------------------------
 covsel <- rfe(fm,
               data = d,  
               sizes = seq(from=10, to=length(ncovs)-1, by = 5),
@@ -112,22 +136,43 @@ covsel <- rfe(fm,
 stopCluster(cl)
 saveRDS(covsel, "02-Outputs/models/covsel.rda")
 
-## 2.3 - Plot selection of covariates ------------------------------------------
+### 2.1.3 - Plot selection of covariates ------------------------------------------
 trellis.par.set(caretTheme())
 plot(covsel, type = c("g", "o"))
 
 # Extract selection of covariates and subset covs
 opt_covs <- predictors(covsel)
 
+
+## 2.2 with Boruta ----
+library(Boruta)
+
+# run the Boruta algorithm
+fs_bor <- Boruta(y = d$soc_0_30, x = d[-1], maxRuns = 35, doTrace = 1)
+
+# plot variable importance and selected features
+plot(fs_bor)
+
+# plot evolution of the feature selection
+plotImpHistory(fs_bor)
+
+# extract the selected feature variables
+fs_vars <- getSelectedAttributes(fs_bor)
+
+# view summary of the results
+View(attStats(fs_bor))
+
+
 # 3 - QRF Model calibration ====================================================
-## 3.1 - Update formula with the selected covariates ---------------------------
+## 3.1 using quantreg
+## 3.1.1 - Update formula with the selected covariates ---------------------------
 fm <- as.formula(paste(soilatt," ~", paste0(opt_covs, collapse = "+")))
 
 # parallel processing
 cl <- makeCluster(detectCores()-1)
 registerDoParallel(cl)
 
-## 3.2 - Set training parameters -----------------------------------------------
+## 3.1.2 - Set training parameters -----------------------------------------------
 fitControl <- trainControl(method = "repeatedcv",
                            number = 10,         ## 10 -fold CV
                            repeats = 3,        ## repeated 3 times
@@ -158,6 +203,71 @@ print(model)
 saveRDS(model, file = paste0("02-Outputs/models/model_",soilatt,".rds"))
 #readRDS('02-Outputs/models/model_bd_0_30.rds')
 
+## 3.2 - Update formula with the selected covariates using ranger---------------
+
+fm <- as.formula(paste(soilatt," ~", paste0(opt_covs, collapse = "+")))
+
+
+## 3.2 using ranger quantreg = TRUE ----
+## 3.2.1 - Set training parameters -----------------------------------------------
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,         ## 10 -fold CV
+                           repeats = 3,        ## repeated 3 times
+                           savePredictions = TRUE)
+
+# Tune mtry hyperparameters
+mtry <- round(length(fs_bor)/3)
+tuneGrid <-  expand.grid(
+  mtry = abs(c(mtry-5, mtry, mtry+5)),
+  min.node.size = c(1, 5, 10),
+  splitrule = c("variance", "extratrees", "maxstat", "beta")
+  )
+
+## 3.2.3 - Calibrate the QRF model -----------------------------------------------
+model_rn <- caret::train(
+  y = d$soc_0_30, x = d[-1],
+  method = "ranger",
+  quantreg = TRUE,
+  importance = "permutation",
+  trControl = fitControl,
+  verbose = TRUE,
+  tuneGrid = tuneGrid
+  )
+
+rn <- ranger(y = d$soc_0_30, x = d[-1], quantreg = TRUE, keep.inbag = TRUE)
+
+pred1 <- predict(rn, d, type = "se")
+pred2 <- predict(rn, d, type = "quantiles", quantiles = c(0.1, 0.5, 0.9))
+pred3 <- predict(rn, d, type = "quantiles", what = sd)
+pred4 <- predict(rn, d, type = "quantiles", what = mean)
+pred5 <- predict(rn, d, type = "quantiles", what = function(x) quantile(x, probs = c(0.1, 0.5, 0.9)))
+
+# mean prediction
+head(pred1$predictions)
+head(pred4$predictions[1, ])
+
+# standard error
+head(pred1$se)
+
+# standard deviation
+head(pred1$se * sqrt(114))
+head(pred3$predictions[1, ])
+
+# median and quantiles
+head(pred2$predictions)
+head(pred5$predictions)
+
+
+## 3.2.4 - Extract predictor importance as relative values (%)
+x <- model_rn$finalModel$variable.importance
+model_rn$importance <- x
+## 3.2.5 - Print and save model --------------------------------------------------
+print(model_rn)
+saveRDS(model_rn, file = paste0("02-Outputs/models/model_rn_",soilatt,".rds"))
+#readRDS('02-Outputs/models/model_bd_0_30.rds')
+
+
+
 # 4 - Uncertainty assessment ===================================================
 # extract observed and predicted values
 o <- model$pred$obs
@@ -180,6 +290,8 @@ eval(p,o)
 
 ## 4.3 - Plot Covariate importance ---------------------------------------------
 (g2 <- varImpPlot(model$finalModel, main = soilatt, type = 1))
+
+vip::vip(model_rn$finalModel)
 
 # png(filename = paste0("02-Outputs/importance_",soilatt,".png"), 
 #     width = 15, height = 15, units = "cm", res = 600)
@@ -238,6 +350,18 @@ for (j in seq_along(tile)) {
   print(paste("tile",tile[j]))
 }
 
+## 5.2.2 - Predict soil attributes NO tiles with ranger ------------------------
+
+predfun <- function(model, ...) predict(model, ...)
+
+idx <- which(
+  names(covs) %in% names(fs_bor$finalDecision)
+)
+covs2 <- covs[[idx]]
+
+model_r <- predict(covs2, model_rn$finalModel, fun = predfun, index = 1, progress = "text", overwrite = TRUE, na.rm = TRUE, filename = "./01-Data/test.tif")
+
+
 ## 5.3 - Merge tiles both prediction and st.Dev --------------------------------
 f_mean <- list.files(path = "02-Outputs/tiles/soilatt_tiles/", 
                      pattern = paste0(soilatt,"_tile_"), full.names = TRUE)
@@ -275,7 +399,7 @@ plot(pred_sd)
 
 # 6 - Export final maps ========================================================
 ## 6.1 - Mask croplands --------------------------------------------------------
-msk <- rast("01-Data/covs/mask.tif")
+msk <- rast("01-Data/mask.tif")
 plot(msk)
 pred_mean <- mask(pred_mean, msk)
 plot(pred_mean)
